@@ -47,17 +47,17 @@ function initMap() {
 async function downloadDemographicData() {
   const dmgResp = await fetch('../data/phl_blockgroup_dmg.csv');
   const dmgText = await dmgResp.text();
-  const dmg = csv.parse(dmgText, {
+  const dmgRows = csv.parse(dmgText, {
     columns: false, // Don't generate object literals -- just use arrays
     from_line: 2, // Skip the first line (the header)
   });
 
-  const dmgByGeoid = dmg.reduce((acc, record) => {
-    const [state, county, tract, bg] = record.slice(record.length - 4);
+  const dmgByGeoid = {};
+  for (const row of dmgRows) {
+    const [state, county, tract, bg] = row.slice(row.length - 4);
     const geoid = `${state}${county}${tract}${bg}`;
-    acc[geoid] = record.slice(0, record.length - 4);
-    return acc;
-  }, {});
+    dmgByGeoid[geoid] = row.slice(0, row.length - 4);
+  }
 
   return dmgByGeoid;
 }
@@ -100,15 +100,15 @@ const RACE_LABELS = [
  *                  compared value.
  */
 function maximal(arr, fn) {
-  return arr.reduce((maxInfo, item, index) => {
+  let maxInfo = null;
+  for (const [index, item] of arr.entries()) {
     const value = fn ? fn(item) : item;
 
     if (maxInfo === null || value > maxInfo.value) {
-      return { value, item, index };
+      maxInfo = { value, item, index };
     }
-
-    return maxInfo;
-  }, null);
+  }
+  return maxInfo;
 }
 
 /**
@@ -124,12 +124,12 @@ function getGeoID(feature) {
 /**
  * Calculate demographic summary information for a given blockgroup record.
  *
- * @param {Array} dmgRecord An array of demographic information, as loaded
- *                          from a CSV
+ * @param {Array} dmgRow An array of demographic information, as loaded
+ *                       from a CSV
  * @return {object} An object with demographic summary information
  */
-function getDemographicSummary(dmgRecord) {
-  const [totalPop, , ...racePops] = dmgRecord.map((x) => 1 * x);
+function getDemographicSummary(dmgRow) {
+  const [totalPop, , ...racePops] = dmgRow.map((x) => 1 * x);
 
   if (totalPop <= 2) {
     return null;
@@ -144,6 +144,8 @@ function getDemographicSummary(dmgRecord) {
     largestRaceLabel,
   };
 }
+
+let THRESHOLD = 0.5;
 
 /**
  * Construct a path options object for use in styling GeoJSON features.
@@ -167,7 +169,7 @@ function calcFeatureStyle(feature, dmgData) {
   }
 
   const largestRacePortion = 1.0 * summary.largestRacePop / summary.totalPop;
-  const minSegregatedPortion = 0.5;
+  const minSegregatedPortion = THRESHOLD;
 
   const color = colors[summary.largestRaceIndex];
   const opacity = Math.max(0, (largestRacePortion - minSegregatedPortion) / (1 - minSegregatedPortion));
@@ -189,8 +191,8 @@ function initDataLayer(geoData, dmgData) {
 
   dataLayer.bindTooltip((l) => {
     const geoid = getGeoID(l.feature);
-    const record = dmgData[geoid];
-    const summary = getDemographicSummary(record);
+    const row = dmgData[geoid];
+    const summary = getDemographicSummary(row);
 
     return summary === null ? 'No statistics<br>available' : `
       ${(summary.largestRacePop * 100.0 / summary.totalPop).toFixed(1)}% ${summary.largestRaceLabel}<br>
@@ -198,7 +200,35 @@ function initDataLayer(geoData, dmgData) {
     `;
   });
 
+  dataLayer.on('tooltipopen', (evt) => {
+    evt.layer.setStyle({
+      stroke: true,
+      weight: 2,
+      color: 'gray',
+      opacity: 1,
+    });
+  });
+
+  dataLayer.on('tooltipclose', (evt) => {
+    dataLayer.resetStyle();
+  });
+
   return dataLayer;
+}
+
+/**
+ * This zip function (generator) operates like the Python zip function.
+ * https://docs.python.org/3/library/functions.html#zip
+ *
+ * @param  {...Array} arrays One or more arrays to combine
+ * @yield  Array
+ */
+function* zip(...arrays) {
+  const minLength = Math.min(...arrays.map((arr) => arr.length));
+
+  for (let i = 0; i < minLength; ++i) {
+    yield arrays.map((arr) => arr[i]);
+  }
 }
 
 function initLegend() {
@@ -210,31 +240,35 @@ function initLegend() {
     const colors = d3.schemeCategory10;
 
     // Loop through the races and generate a label and colored square for each
-    let html = `
-    <h2>Racial Classifications</h2>
+    div.innerHTML = `
+      <h2>Racial Classifications</h2>
 
-    <ul class="legend-entries">
+      <ul class="legend-entries">
+        ${[...zip(races, colors)].map(([race, color]) => `
+          <li class="legend-entry">
+            <span class="legend-icon" style="background-color: ${color};"></span>
+            <span class="legend-label">${race.replace(/ /g, '&nbsp;')}</span>
+          </li>
+        `).join(' ')}
+      </ul>
+
+      <p class="legend-description"><em>
+        A census block group will only be visible if the percentage of the total
+        population within that block group is dominated (above a threshold) by a
+        single racial classification.
+      </em></p>
+
+      <h2>Majority Threshold: <span id="majority-threshold-display">50%</span></h2>
+      <input id="majority-threshold" type="range" min="0" max="100" value="50">
     `;
 
-    for (let i = 0; i < races.length; i++) {
-      html += `
-        <li class="legend-entry">
-          <span class="legend-icon" style="background-color: ${colors[i]};"></span>
-          <span class="legend-label">${races[i].replace(/ /g, '&nbsp;')}</span>
-        </li>
-      `;
-    }
-
-    html += `
-    </ul>
-
-    <p class="legend-description"><em>
-      A census block group will only be visible if the percentage of the total
-      population within that block group is dominated (50% or greater) by a
-      single racial classification.
-    </em></p>
-    `;
-    div.innerHTML = html;
+    const thresholdInput = div.querySelector('#majority-threshold');
+    const thresholdDisplay = div.querySelector('#majority-threshold-display');
+    thresholdInput.addEventListener('change', () => {
+      THRESHOLD = thresholdInput.value / 100.0;
+      thresholdDisplay.innerHTML = `${thresholdInput.value}%`;
+      dataLayer.resetStyle();
+    });
 
     return div;
   };
